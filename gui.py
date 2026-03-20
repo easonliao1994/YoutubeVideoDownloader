@@ -5,6 +5,58 @@ import threading
 import os
 import sys
 
+
+FFMPEG_PATH = os.path.join(os.path.dirname(__file__), 'ffmpeg', 'bin', 'ffmpeg.exe')
+
+
+def build_ydl_opts(**overrides):
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['default'],
+            }
+        },
+        'js_runtimes': {
+            'node': {
+                'version': '>=20',
+            }
+        },
+        'retries': 3,
+        'noplaylist': True,
+    }
+
+    if os.path.exists(FFMPEG_PATH):
+        ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+
+    ydl_opts.update(overrides)
+    return ydl_opts
+
+
+def build_download_format(selected):
+    if not selected:
+        return 'bestvideo*+bestaudio/best'
+
+    format_id = selected['format_id']
+    target_height = selected['height']
+
+    if selected.get('has_audio'):
+        return (
+            f'{format_id}/'
+            f'best[height<={target_height}][vcodec!=none][acodec!=none]/'
+            f'best[height<={target_height}]/best'
+        )
+
+    return (
+        f'{format_id}+bestaudio[ext=m4a]/'
+        f'{format_id}+bestaudio/'
+        f'bestvideo[height<={target_height}][ext=mp4]+bestaudio[ext=m4a]/'
+        f'bestvideo[height<={target_height}]+bestaudio/'
+        f'best[height<={target_height}][vcodec!=none][acodec!=none]/best'
+    )
+
+
 class YoutubeDownloaderGUI:
     def __init__(self, root):
         self.root = root
@@ -104,10 +156,7 @@ class YoutubeDownloaderGUI:
         threading.Thread(target=self.analyze_video, args=(url,), daemon=True).start()
 
     def analyze_video(self, url):
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
+        ydl_opts = build_ydl_opts()
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -115,22 +164,42 @@ class YoutubeDownloaderGUI:
                 
                 # Process formats
                 formats = info.get('formats', [])
-                seen_heights = set()
+                available_formats = []
                 self.resolutions = []
                 
-                # Sort formats by height descending
-                formats.sort(key=lambda x: (x.get('height') or 0), reverse=True)
-                
                 for f in formats:
-                    height = f.get('height')
-                    if height and height not in seen_heights and f.get('vcodec') != 'none':
-                        self.resolutions.append({
-                            'height': height,
-                            'format_id': f['format_id'],
-                            'ext': f['ext'],
-                            'filesize': f.get('filesize', 0)
-                        })
-                        seen_heights.add(height)
+                    if f.get('vcodec') == 'none' or not f.get('height'):
+                        continue
+
+                    available_formats.append({
+                        'height': f['height'],
+                        'format_id': f['format_id'],
+                        'ext': f.get('ext', 'unknown'),
+                        'filesize': f.get('filesize') or f.get('filesize_approx') or 0,
+                        'has_audio': f.get('acodec') not in (None, 'none'),
+                        'protocol': f.get('protocol', ''),
+                        'vcodec': f.get('vcodec', ''),
+                        'note': f.get('format_note', ''),
+                    })
+
+                available_formats.sort(
+                    key=lambda item: (
+                        item['height'],
+                        item['protocol'] == 'https',
+                        item['has_audio'],
+                        item['ext'] == 'mp4',
+                        item['vcodec'].startswith('avc1'),
+                        item['filesize'],
+                    ),
+                    reverse=True,
+                )
+
+                seen_heights = set()
+                for fmt in available_formats:
+                    if fmt['height'] in seen_heights:
+                        continue
+                    self.resolutions.append(fmt)
+                    seen_heights.add(fmt['height'])
                 
                 # Update UI in main thread
                 self.root.after(0, self.update_ui_after_analysis, info)
@@ -150,7 +219,10 @@ class YoutubeDownloaderGUI:
             if res['filesize']:
                 size_mb = res['filesize'] / 1024 / 1024
                 size_str = f" - approx. {size_mb:.1f}MB"
-            values.append(f"{res['height']}p ({res['ext']}){size_str}")
+            note = res['note'] or ('with audio' if res['has_audio'] else 'merge audio')
+            if res['protocol'] == 'm3u8_native':
+                note = f"{note}, HLS"
+            values.append(f"{res['height']}p ({res['ext']}) - {note}{size_str}")
         
         values.append("Best Quality (Auto)")
         self.combo_res['values'] = values
@@ -182,19 +254,21 @@ class YoutubeDownloaderGUI:
         
         # Determine format
         if selection_idx < len(self.resolutions):
-            target_height = self.resolutions[selection_idx]['height']
-            format_str = f'bestvideo[height={target_height}]+bestaudio/best[height={target_height}]'
+            selected = self.resolutions[selection_idx]
+            format_str = build_download_format(selected)
         else:
-            format_str = 'bestvideo+bestaudio/best'
+            format_str = 'bestvideo*+bestaudio/best'
             
         threading.Thread(target=self.download_process, args=(download_path, format_str), daemon=True).start()
 
     def download_process(self, download_path, format_str):
-        ydl_opts = {
-            'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-            'format': format_str,
-            'progress_hooks': [self.progress_hook],
-        }
+        ydl_opts = build_ydl_opts(
+            outtmpl=os.path.join(download_path, '%(title)s.%(ext)s'),
+            format=format_str,
+            progress_hooks=[self.progress_hook],
+            quiet=False,
+            no_warnings=False,
+        )
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
