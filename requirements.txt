@@ -1,1 +1,1 @@
-yt-dlp[default]
+psutil>=5.9
